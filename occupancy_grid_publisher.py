@@ -3,87 +3,101 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile
-from sensor_msgs.msg import Image
 from nav_msgs.msg import OccupancyGrid, MapMetaData
-from cv_bridge import CvBridge
-import cv2
-import numpy as np
-import math
+from bittle_msgs.msg import Yolo
 
 class OccupancyGridPublisher(Node):
     def __init__(self):
         super().__init__('occupancy_grid_publisher')
         qos_profile = QoSProfile(depth=10)
 
-        # Subscribe to the camera feed
-        self.sub_camera = self.create_subscription(
-            Image,
-            '/camera/stream',
-            self.camera_callback,
+        # Subscribe to YOLO bounding boxes
+        self.sub_detections = self.create_subscription(
+            Yolo,
+            '/yolo_topic',
+            self.detections_callback,
             qos_profile
         )
 
         # Publisher for the occupancy grid
         self.pub_grid = self.create_publisher(OccupancyGrid, '/map', qos_profile)
 
-        self.bridge = CvBridge()
+        # Define some map parameters
+        # (Assumes the overhead camera sees a 640x480 area and we treat each pixel as 1 'cell')
+        # Adjust as needed
+        self.map_resolution = 0.01  # e.g. each cell = 1 cm in the real world
+        self.map_width  = 320      # in cells
+        self.map_height = 240       # in cells
 
-        # Define some parameters for the map
-        self.map_resolution = 0.01  # 1 cm/pixel in this naive example
-        self.map_width = 320       # same width as your camera feed
-        self.map_height = 240      # same height as your camera feed
+        self.get_logger().info("OccupancyGridPublisher node started. Subscribing to /yolo_topic.")
 
-        self.get_logger().info("OccupancyGridPublisher node has been started.")
+    def detections_callback(self, msg: Yolo):
+        """
+        We get bounding boxes in pixel coordinates (xywh_list).
+        We’ll mark those bounding boxes in the OccupancyGrid as 'occupied' = 100.
+        """
 
-    def camera_callback(self, msg: Image):
-        # 1. Convert ROS Image to OpenCV image
-        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        # 1) Create a blank occupancy array with all free = 0
+        occupancy_data = [0] * (self.map_width * self.map_height)
 
-        # 2. Process the image to create a binary occupancy representation
-        #    For example: grayscale -> threshold
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
+        # 2) Convert the flattened XYWH list into bounding boxes
+        #    XYWH = [ x, y, w, h,  x2, y2, w2, h2, ... ]
+        #    Typically x,y is the center, but if YOLO is returning absolute coords
+        #    you'd want to confirm if x,y is center or top-left. By default, YOLO
+        #    'xywh' means center x,y, width, height. So we offset accordingly.
+        xywh = msg.xywh_list
+        for i in range(0, len(xywh), 4):
+            center_x = xywh[i + 0]
+            center_y = xywh[i + 1]
+            width    = xywh[i + 2]
+            height   = xywh[i + 3]
 
-        # 3. Convert the binary image into occupancy data
-        #    - Occupied (black) = 100
-        #    - Free (white) = 0
-        # Note: The threshold is reversed for demonstration (white => free, black => occupied)
-        occupancy_data = []
-        for row in thresh:
-            for pixel in row:
-                if pixel == 255:
-                    occupancy_data.append(0)   # 0 = free
-                else:
-                    occupancy_data.append(100) # 100 = occupied
+            # Convert from center-based to top-left and bottom-right
+            x1 = int(center_x - (width  / 2))
+            y1 = int(center_y - (height / 2))
+            x2 = int(center_x + (width  / 2))
+            y2 = int(center_y + (height / 2))
 
-        # 4. Create the OccupancyGrid message
+            # Ensure bounds
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(self.map_width - 1,  x2)
+            y2 = min(self.map_height - 1, y2)
+
+            # 3) Mark these bounding-box cells as occupied (100)
+            for row in range(y1, y2 + 1):
+                for col in range(x1, x2 + 1):
+                    idx = row * self.map_width + col
+                    occupancy_data[idx] = 100
+
+        # 4) Create the OccupancyGrid message
         grid_msg = OccupancyGrid()
 
         # Header
         grid_msg.header.stamp = self.get_clock().now().to_msg()
-        grid_msg.header.frame_id = 'map'  # Or whatever frame you want
+        grid_msg.header.frame_id = 'map'  # or 'camera' or anything you prefer
 
         # Map MetaData
-        grid_msg.info = MapMetaData()
-        grid_msg.info.resolution = self.map_resolution       # meters/pixel
-        grid_msg.info.width = self.map_width
-        grid_msg.info.height = self.map_height
-        grid_msg.info.origin.position.x = 0.0
-        grid_msg.info.origin.position.y = 0.0
-        grid_msg.info.origin.position.z = 0.0
-        grid_msg.info.origin.orientation.w = 1.0  # no rotation
+        meta = MapMetaData()
+        meta.resolution = self.map_resolution  # meters per cell
+        meta.width      = self.map_width
+        meta.height     = self.map_height
+        # origin = bottom-left corner in world space. For overhead, 0,0 is fine.
+        meta.origin.position.x = 0.0
+        meta.origin.position.y = 0.0
+        meta.origin.orientation.w = 1.0
+        grid_msg.info = meta
 
-        # Occupancy data
+        # 5) Occupancy data
         grid_msg.data = occupancy_data
 
-        # 5. Publish the occupancy grid
+        # 6) Publish the occupancy grid
         self.pub_grid.publish(grid_msg)
-        self.get_logger().info("Published occupancy grid.")
+        self.get_logger().info("Published occupancy grid with {} bounding boxes.".format(len(xywh)//4))
 
 def main(args=None):
     rclpy.init(args=args)
     node = OccupancyGridPublisher()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
